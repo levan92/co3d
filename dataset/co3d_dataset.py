@@ -1,3 +1,5 @@
+# Adapted from https://github.com/facebookresearch/co3d/blob/master/dataset/co3d_dataset.py
+
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
 
@@ -20,6 +22,7 @@ import numpy as np
 from PIL import Image
 from plyfile import PlyData  # TODO: get rid of it after pt3d supports loading normals
 import torch
+import cv2
 
 from pytorch3d.renderer.cameras import CamerasBase, PerspectiveCameras
 from pytorch3d.structures.pointclouds import Pointclouds
@@ -105,6 +108,8 @@ class FrameData:
     sequence_point_cloud_idx: Optional[torch.Tensor] = None
     frame_type: Union[str, List[str], None] = None  # seen | unseen
     meta: dict = field(default_factory=lambda: {})
+    uv: Optional[torch.Tensor] = None
+    raw_cam = {}
 
     def to(self, *args, **kwargs):
         new_params = {}
@@ -374,6 +379,7 @@ class Co3dDataset(torch.utils.data.Dataset):
                 frame_data.image_path,
                 frame_data.mask_crop,
                 scale,
+                frame_data.uv,
             ) = self._load_crop_images(
                 entry, frame_data.fg_probability, clamp_bbox_xyxy
             )
@@ -385,11 +391,15 @@ class Co3dDataset(torch.utils.data.Dataset):
                 frame_data.depth_mask,
             ) = self._load_mask_depth(entry, clamp_bbox_xyxy, frame_data.fg_probability)
 
-        frame_data.camera = self._get_pytorch3d_camera(
-            entry,
-            scale,
-            clamp_bbox_xyxy,
-        )
+        (
+            frame_data.camera,
+            frame_data.raw_cam
+        ) = self._get_pytorch3d_camera(
+                                        entry,
+                                        scale,
+                                        clamp_bbox_xyxy,
+                                        frame_data.raw_cam
+                                        )
 
         if point_cloud is not None:
             frame_data.sequence_point_cloud_path = os.path.join(
@@ -430,6 +440,8 @@ class Co3dDataset(torch.utils.data.Dataset):
         assert self.dataset_root is not None and entry.image is not None
         path = os.path.join(self.dataset_root, entry.image.path)
         image_rgb = _load_image(path)
+        _, h, w = image_rgb.shape
+        uv = np.mgrid[0:h,0:w].astype(np.int32)
 
         if image_rgb.shape[-2:] != entry.image.size:
             raise ValueError(
@@ -439,14 +451,20 @@ class Co3dDataset(torch.utils.data.Dataset):
         if self.box_crop:
             assert clamp_bbox_xyxy is not None
             image_rgb = _crop_around_box(image_rgb, clamp_bbox_xyxy, path)
+            uv = _crop_around_box(uv, clamp_bbox_xyxy, path)
 
         image_rgb, scale, mask_crop = self._resize_image(image_rgb)
+
+        uv = uv.transpose(1,2,0)
+        uv = cv2.resize(uv, (self.image_width, self.image_height), interpolation=cv2.INTER_NEAREST)
+        uv = torch.from_numpy(np.flip(uv, axis=-1).copy()).long()
+        uv = uv.reshape(-1, 2).float()
 
         if self.mask_images:
             assert fg_probability is not None
             image_rgb *= fg_probability
 
-        return image_rgb, path, mask_crop, scale
+        return image_rgb, path, mask_crop, scale, uv
 
     def _load_mask_depth(self, entry, clamp_bbox_xyxy, fg_probability):
         path = os.path.join(self.dataset_root, entry.depth.path)
@@ -483,7 +501,8 @@ class Co3dDataset(torch.utils.data.Dataset):
 
         return depth_map, path, depth_mask
 
-    def _get_pytorch3d_camera(self, entry, scale, clamp_bbox_xyxy):
+    def _get_pytorch3d_camera(self, entry, scale, clamp_bbox_xyxy, raw_cam_dict):
+
         # principal point and focal length
         principal_point = torch.tensor(
             entry.viewpoint.principal_point, dtype=torch.float
@@ -508,7 +527,10 @@ class Co3dDataset(torch.utils.data.Dataset):
 
         # principal point and focal length in pixels
         principal_point_px = -1.0 * (principal_point - 1.0) * half_image_size_wh_orig
+        raw_cam_dict['principal_point'] = principal_point_px
         focal_length_px = focal_length * half_image_size_wh_orig
+        raw_cam_dict['focal_length'] = focal_length_px
+
         if self.box_crop:
             assert clamp_bbox_xyxy is not None
             principal_point_px -= clamp_bbox_xyxy[:2]
@@ -517,12 +539,17 @@ class Co3dDataset(torch.utils.data.Dataset):
         principal_point = 1 - principal_point_px * scale / half_image_size_wh_output
         focal_length = focal_length_px * scale / half_image_size_wh_output
 
+        R = torch.tensor(entry.viewpoint.R, dtype=torch.float)
+        T = torch.tensor(entry.viewpoint.T, dtype=torch.float)
+        raw_cam_dict['R'] = R
+        raw_cam_dict['T'] = T
+
         return PerspectiveCameras(
             focal_length=focal_length[None],
             principal_point=principal_point[None],
-            R=torch.tensor(entry.viewpoint.R, dtype=torch.float)[None],
-            T=torch.tensor(entry.viewpoint.T, dtype=torch.float)[None],
-        )
+            R=R[None],
+            T=T[None],
+        ), raw_cam_dict
 
     def _load_frames(self):
         print(f"Loading Co3D frames from {self.frame_annotations_file}.")
@@ -762,7 +789,7 @@ def _get_1d_bounds(arr):
 
 def _get_bbox_from_mask(mask, thr, decrease_quant=0.05):
     # bbox in xywh
-    masks_for_box = np.zeros_like(mask)
+    masks_for_box = mask
     while masks_for_box.sum() <= 1.0:
         masks_for_box = (mask > thr).astype(np.float32)
         thr -= decrease_quant
